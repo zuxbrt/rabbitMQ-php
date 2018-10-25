@@ -17,203 +17,198 @@ use PhpAmqpLib\Message\AMQPMessage;
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/functions.php';
 
-$request = Request::createFromGlobals();
-$locator = new FileLocator(__DIR__ . '/../config');
+$connection = new AMQPStreamConnection('localhost', 5672, 'guest', 'guest');
+$channel = $connection->channel();
+$channel->queue_declare('rpc_queue', false, false, false, false);
 
-$data = new ResponseBootstrap();
+
+echo " [x] Awaiting RPC requests\n";
 
 
-// DI container
-$container = new DependencyInjection\ContainerBuilder;
-$container->setParameter('path.root', __DIR__);
-$resolver = new LoaderResolver(
-    [
-        new YamlFileLoader($container, $locator),
-        new PhpFileLoader($container, $locator),
-    ]
-);
+/**
+ * Set response
+ *
+ * @param $params
+ * @return JsonResponse|Response
+ */
+function setResponse($params){
 
-$loader = new DelegatingLoader($resolver);
+    $request = Request::createFromGlobals();
 
-// check if production ready
-if(getenv("ENVIVORMENT") === "prod"){
-    $loader->load('config-production.yml');
-}else{
-    $loader->load('config-development.yml');
-}
+    $locator = new FileLocator(__DIR__ . '/../config');
 
-$container->compile();
+    $data = new ResponseBootstrap();
 
-// routing
-$loader = new Routing\Loader\YamlFileLoader($locator);
-$context = new Routing\RequestContext();
-$context->fromRequest($request);
 
-$matcher = new Routing\Matcher\UrlMatcher(
-    $loader->load('routing.yml'),
-    $context
-);
-try {
 
-    $parameters = $matcher->match($request->getPathInfo());
-    foreach ($parameters as $key => $value) {
-        $request->attributes->set($key, $value);
+    // DI container
+    $container = new DependencyInjection\ContainerBuilder;
+    $container->setParameter('path.root', __DIR__);
+
+
+    $resolver = new LoaderResolver(
+        [
+            new YamlFileLoader($container, $locator),
+            new PhpFileLoader($container, $locator),
+        ]
+    );
+
+    $loader = new DelegatingLoader($resolver);
+
+    // check if production ready
+    if(getenv("ENVIVORMENT") === "prod"){
+        $loader->load('config-production.yml');
+    }else{
+        $loader->load('config-development.yml');
     }
 
+    // die(print_r($loader));
+
+    $container->compile();
+
+
+    // routing
+    $loader = new Routing\Loader\YamlFileLoader($locator);
+    // $context = new Routing\RequestContext();
+    // $context->fromRequest($request);
+
+    $requestContext = new Routing\RequestContext();
+    $requestContext->setPathInfo('/swapp/all');
+    $requestContext->setMethod('GET');
+    $requestContext->setHost('swapper-swapps');
+    $requestContext->setScheme('http');
+    $requestContext->setHttpPort(8888);
+    $requestContext->setHttpsPort(443);
+    $requestContext->setQueryString('token_user_id=2&limit=7');
+    $requestContext->setParameters([]);
+
+    $matcher = new Routing\Matcher\UrlMatcher(
+        $loader->load('routing.yml'),
+        $requestContext
+    );
+
+   // die(print_r($matcher));
+
+    try {
 
 
 
+        $parameters = [];
+        $parameters["token_user_id"] = "096654fb5de7fddc04d44cd67b8562390b8e3f05";
+        $parameters["limit"] = "7";
 
+        $parameters = $matcher->match($requestContext->getPathInfo());
+        //die(print_r($parameters));
 
-
-    $connection = new AMQPStreamConnection('localhost', 5672, 'guest', 'guest');
-    $channel = $connection->channel();
-    $channel->queue_declare('rpc_queue', false, false, false, false);
-
-
-    echo " [x] Awaiting RPC requests\n";
-
-
-    /**
-     * Get data
-     *
-     * @param $requestData
-     * @return string
-     */
-    function decodeResponse($requestData){
-        $params = json_decode($requestData);
-
-        if ($route = $params->_route != null){
-            $route = $params->_route;
-        } else {
-            $route = "none";
+        foreach ($parameters as $key => $value) {
+            $request->attributes->set($key, $value);
+            // print_r($parameters);
+            // echo "<br/>";
         }
 
-        if ($action = $params->action != null){
-            $action = $params->action;
-        } else {
-            $action = "none";
-        }
 
-        if ($userId = $params->user_id != null){
-            $userId = $params->user_id;
-        } else {
-            $userId = "none";
-        }
+        $command = "get" . "all";
 
-        if ($limit = $params->limit != null){
-            $limit = $params->limit;
-        } else {
-            $limit = "none";
-        }
 
-        $method = $params->method;
+        // die(print_r($request));
+        $controller = $container->get('controller.' . "swapp");
 
-        return strtoupper($method) . ", route: " . $route . ", " . $action . ", limit: " . $limit . ", user_id: " . $userId;
+        // $controller = $container->get('controller.' . $request->get('resource'));
+
+        // die($controller->{$command}($request));
+        // $data = $controller->{$command}($request);
+
+        $controller->{$command}($request);
+        $data = $controller->{$command}($request);
+
+        return $data;
+
+    } catch (\Exception $exception) {
+        // TODO log data
+        $data->setStatus(404);
+        $data->setMessage('No routes found');
+        // die(print_r($exception->getMessage()));
+
+        echo "Message: ". $exception->getMessage() . ", on line " . $exception->getLine() . ", file: " . $exception->getFile();
+
+    } catch (\TypeError $error) {
+        // TODO log data
+        $data->setStatus(404);
+        $data->setMessage(new Response("Invalid dependency: {$error->getMessage()}"));
+        // die(print_r(new Response("Invalid dependency: {$error->getMessage()}")));
+
+        echo "invalid dependency:   {$error->getMessage()}";
     }
 
-
-
-    /**
-     * RPC response callback
-     *
-     * @param $request
-     */
-    $callback = function ($request) {
-        $jsonData = $request->body;
-
-        $params = decodeResponse($jsonData);
-
-        echo ' [.] Request from swapps ---->(', $params, ")\n";
-
-        $msg = new AMQPMessage(
-            (string)$jsonData,
-            // (string)json_encode($params),
-            array('correlation_id' => $request->get('correlation_id'))
-        );
-
-        $request->delivery_info['channel']->basic_publish(
-            $msg,
-            '',
-            $request->get('reply_to')
-        );
-
-        $request->delivery_info['channel']->basic_ack(
-            $request->delivery_info['delivery_tag']
-        );
-    };
-
-
-
-    $channel->basic_qos(null, 1, null);
-    $channel->basic_consume('rpc_queue', '', false, false, false, false, $callback);
-    while (count($channel->callbacks)) {
-        $channel->wait();
+    // Check if json in array from
+    if(!empty($data->getData())){
+        $response = new JsonResponse($data->getData());
+        // set encoding to handle istring as int
+        $response->setEncodingOptions(JSON_NUMERIC_CHECK);
+    }else{
+        // Not json
+        $response = new Response;
     }
 
-    $channel->close();
-    $connection->close();
+    //Set custom headers
+    $response->setStatusCode(
+        (int)$data->getStatus(),
+        empty($data->getMessage()) ? $data->getMessage() : null
+    );
 
+    // preflighted request handle
+    if($request->getMethod() === 'OPTIONS'){
+        // set status
+        $response->setStatusCode((int)200);
+    }
 
+    // headers
+    $response->headers->set('Access-Control-Allow-Origin', '*');
+    $response->headers->set('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,PUT,DELETE');
+    $response->headers->set('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    $response->headers->set('Access-Control-Allow-Credentials', 'true');
+    $response->headers->set("Access-Control-Max-Age", "1728000");
 
-
-
-
-
-
-
-
-
-
-
-
-    // $command = $request->getMethod() . $request->get('action');
-    // $controller = $container->get('controller.' . $request->get('resource'));
-
-
-    // $controller->{$command}($request);
-    // $data = $controller->{$command}($request);
-
-} catch (\Exception $exception) {
-    // TODO log data
-    $data->setStatus(404);
-    $data->setMessage('No routes found');
-    die(print_r($exception->getMessage()));
-} catch (\TypeError $error) {
-    // TODO log data
-    $data->setStatus(404);
-    $data->setMessage(new Response("Invalid dependency: {$error->getMessage()}"));
-    die(print_r(new Response("Invalid dependency: {$error->getMessage()}")));
+    return $response;
 }
 
-// Check if json in array from
-if(!empty($data->getData())){
-    $response = new JsonResponse($data->getData());
-    // set encoding to handle istring as int
-    $response->setEncodingOptions(JSON_NUMERIC_CHECK);
-}else{
-    // Not json
-    $response = new Response;
+
+/**
+ * RPC response callback
+ *
+ * @param $request
+ */
+$callback = function ($request) {
+    $jsonData = $request->body;
+
+    $response = setResponse($jsonData);
+
+    echo ' [.] Request from swapps ---->(', $jsonData, ")\n";
+
+    $msg = new AMQPMessage(
+        //(string)$jsonData,
+        json_encode($response),
+        array('correlation_id' => $request->get('correlation_id'))
+    );
+
+    $request->delivery_info['channel']->basic_publish(
+        $msg,
+        '',
+        $request->get('reply_to')
+    );
+
+    $request->delivery_info['channel']->basic_ack(
+        $request->delivery_info['delivery_tag']
+    );
+};
+
+
+
+$channel->basic_qos(null, 1, null);
+$channel->basic_consume('rpc_queue', '', false, false, false, false, $callback);
+while (count($channel->callbacks)) {
+    $channel->wait();
 }
 
-//Set custom headers
-$response->setStatusCode(
-    (int)$data->getStatus(),
-    empty($data->getMessage()) ? $data->getMessage() : null
-);
-
-// preflighted request handle
-if($request->getMethod() === 'OPTIONS'){
-    // set status
-    $response->setStatusCode((int)200);
-}
-
-// headers
-$response->headers->set('Access-Control-Allow-Origin', '*');
-$response->headers->set('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,PUT,DELETE');
-$response->headers->set('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-$response->headers->set('Access-Control-Allow-Credentials', 'true');
-$response->headers->set("Access-Control-Max-Age", "1728000");
-
-// return response
-// $response->send();
+$channel->close();
+$connection->close();
